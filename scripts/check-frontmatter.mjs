@@ -98,7 +98,10 @@ if (base) {
 
 let files;
 try {
-  files = git(["ls-files", "-z", "--", "translations/"]).split("\0").filter((p) => p.endsWith(".md"));
+  // Check newly written pages before they are staged too, just as the local
+  // --base scope above does. Ignore rules apply only to untracked files.
+  files = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "translations/"])
+    .split("\0").filter((p) => p.endsWith(".md"));
 } catch (e) {
   die(`could not list translated files: ${e.message}`);
 }

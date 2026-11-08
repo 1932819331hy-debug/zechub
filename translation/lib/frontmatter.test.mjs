@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { frontMatterRegion, frontMatterViolation, parseFrontMatter } from "./frontmatter.mjs";
 
 const SRC = "---\npublished: 2025-08-19\n---\n\n# Title\n\nbody\n";
@@ -169,3 +173,103 @@ test("frontMatterRegion distinguishes two different broken blocks of the same ki
   assert.equal(frontMatterViolation(SRC, a).code, frontMatterViolation(SRC, b).code);
   assert.notEqual(frontMatterRegion(a), frontMatterRegion(b));
 });
+
+// Exercise the real local gate, not just its parser. A contributor can run the
+// documented checks before staging a newly written translation.
+function cliFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "zechub-frontmatter-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const write = (path, text) => {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), text);
+  };
+  for (const [path, source] of [
+    ["scripts/check-frontmatter.mjs", new URL("../../scripts/check-frontmatter.mjs", import.meta.url)],
+    ["translation/lib/frontmatter.mjs", new URL("./frontmatter.mjs", import.meta.url)],
+  ]) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    copyFileSync(source, join(root, path));
+  }
+  const git = (...args) => execFileSync("git", [
+    "-c", "user.name=Frontmatter test", "-c", "user.email=fixture@example.invalid",
+    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args,
+  ], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git("init", "-q");
+  write("site/Existing.md", SRC);
+  write("translations/fr/site/Existing.md", SRC);
+  write("site/New page ü.md", SRC);
+  write(".gitignore", "translations/fr/site/Ignored.md\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+  const run = (scoped) => {
+    const index = readFileSync(join(root, ".git/index"));
+    const result = spawnSync(process.execPath, [
+      "scripts/check-frontmatter.mjs", ...(scoped ? ["--base", base] : []),
+    ], { cwd: root, encoding: "utf8", timeout: 15_000 });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null);
+    assert.deepEqual(readFileSync(join(root, ".git/index")), index, "the checker must not stage files");
+    return result;
+  };
+  return { root, write, git, run };
+}
+
+for (const scoped of [false, true]) {
+  const mode = scoped ? "--base" : "whole-tree";
+
+  test(`CLI ${mode}: reject an untracked translation before staging it`, (t) => {
+    const f = cliFixture(t);
+    const path = "translations/fr/site/New page ü.md";
+    const text = "---\npublished: 2024-01-01\n---\n# Nouveau\n";
+    f.write(path, text);
+    const r = f.run(scoped);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.ok(r.stderr.includes(path), r.stderr);
+    assert.match(r.stderr, /values differ/);
+    assert.equal(readFileSync(join(f.root, path), "utf8"), text, "check mode must not repair the page");
+    assert.equal(f.git("ls-files", "--", path), "", "the page remains untracked");
+  });
+
+  test(`CLI ${mode}: count a valid new translation once before and after staging`, (t) => {
+    const f = cliFixture(t);
+    const path = "translations/fr/site/New page ü.md";
+    f.write(path, SRC);
+    for (const phase of ["untracked", "staged", "committed"]) {
+      if (phase === "staged") f.git("add", path);
+      if (phase === "committed") f.git("commit", "-qm", "new translation");
+      const r = f.run(scoped);
+      assert.equal(r.status, 0, `${phase}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, /holds for 2 translated page\(s\)/, phase);
+    }
+  });
+
+  test(`CLI ${mode}: keep tracked pages, but skip ignored, deleted and unrelated files`, (t) => {
+    const f = cliFixture(t);
+    // A tracked file remains eligible even if an ignore rule now matches it.
+    f.write(".gitignore", "translations/fr/site/Ignored.md\ntranslations/fr/site/New page ü.md\n");
+    f.write("translations/fr/site/New page ü.md", SRC);
+    f.git("add", "-f", "translations/fr/site/New page ü.md");
+    f.write("site/Ignored.md", SRC);
+    f.write("translations/fr/site/Ignored.md", "# Missing front matter\n");
+    f.write("translations/fr/notes.md", "---\nnot: [\n---\n");
+    f.write("translations/fr/site/New.txt", "# Not Markdown\n");
+    rmSync(join(f.root, "translations/fr/site/Existing.md"));
+    const r = f.run(scoped);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /holds for 1 translated page\(s\)/);
+  });
+
+  test(`CLI ${mode}: tracked edits still block before and after staging`, (t) => {
+    const f = cliFixture(t);
+    const path = "translations/fr/site/Existing.md";
+    f.write(path, "# Missing front matter\n");
+    for (const staged of [false, true]) {
+      if (staged) f.git("add", path);
+      const r = f.run(scoped);
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.ok(r.stderr.includes(path), r.stderr);
+      assert.match(r.stderr, /has no front matter/);
+    }
+  });
+}
